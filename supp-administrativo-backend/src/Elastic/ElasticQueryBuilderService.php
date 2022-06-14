@@ -1,0 +1,291 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * /src/Elastic/ElasticQueryBuilderService.php.
+ *
+ * @author Advocacia-Geral da União <supp@agu.gov.br>
+ */
+
+namespace SuppCore\AdministrativoBackend\Elastic;
+
+use Exception;
+use ONGR\ElasticsearchDSL\Query\Compound\BoolQuery;
+use ONGR\ElasticsearchDSL\Query\FullText\MatchQuery;
+use ONGR\ElasticsearchDSL\Query\FullText\QueryStringQuery;
+use ONGR\ElasticsearchDSL\Query\TermLevel\ExistsQuery;
+use ONGR\ElasticsearchDSL\Query\TermLevel\RangeQuery;
+use Predis\Client;
+use SuppCore\AdministrativoBackend\Elastic\Message\DenseVectorQueryMessage;
+use Symfony\Component\DependencyInjection\ParameterBag\ParameterBagInterface;
+use Symfony\Component\Messenger\MessageBusInterface;
+
+/**
+ * Class ElasticQueryBuilderService.
+ *
+ * @author Advocacia-Geral da União <supp@agu.gov.br>
+ */
+class ElasticQueryBuilderService
+{
+    private $config;
+    private string $index;
+    private Client $redisClient;
+    private MessageBusInterface $bus;
+    private $denseVector;
+
+    /**
+     * ElasticQueryBuilderService constructor.
+     *
+     * @param ParameterBagInterface $parameterBag
+     * @param Client                $redisClient
+     */
+    public function __construct(ParameterBagInterface $parameterBag, Client $redisClient, MessageBusInterface $bus)
+    {
+        $this->config = $parameterBag->get('elasticsearch');
+        $this->redisClient = $redisClient;
+        $this->bus = $bus;
+    }
+
+    /**
+     * @param string $index
+     */
+    public function init(string $index): void
+    {
+        $this->index = $index;
+        $this->denseVector = null;
+    }
+
+    /**
+     * @param $criteria
+     * @param null $boolQuery
+     *
+     * @return BoolQuery
+     *
+     * @throws Exception
+     */
+    public function proccessCriteria($criteria): BoolQuery
+    {
+        $boolQuery = new BoolQuery();
+
+        foreach ($criteria as $property => $filter) {
+            if ('orX' === $property) {
+                $orBoolQuery = new BoolQuery();
+                foreach ($filter as $orFilter) {
+                    $orBoolQuery->add($this->proccessCriteria($orFilter), BoolQuery::SHOULD);
+                }
+                $boolQuery->add($orBoolQuery, BoolQuery::MUST);
+            } elseif ('andX' === $property) {
+                foreach ($filter as $andFilter) {
+                    $boolQuery->add($this->proccessCriteria($andFilter), BoolQuery::MUST);
+                }
+
+                // return $boolQuery;
+            } else {
+                $nested = explode('.', $property);
+                $root = $this->config['indexes'][$this->index]['properties'];
+
+                foreach ($nested as $nestedProperty) {
+                    if (!isset($root[$nestedProperty])) {
+                        throw new Exception(sprintf('Critério de pesquisa %s nao mapeado no elasticsearch', $property));
+                    }
+                    if (isset($root[$nestedProperty]['properties'])) {
+                        $root = $root[$nestedProperty]['properties'];
+                    } else {
+                        $root = $root[$nestedProperty];
+                    }
+                }
+
+                // query full text search
+                if (isset($root['type']) && 'attachment' === $root['type']) {
+                    $queryString = new QueryStringQuery(
+                        $this->processaTermo(str_replace('like:', '', str_replace('%', '', $filter))),
+                        ['default_field' => 'attachment.content', 'default_operator' => 'AND']
+                    );
+                    $boolQuery->add($queryString, BoolQuery::MUST);
+
+                    continue;
+                    if (isset($root['denseVector']) && $root['denseVector']) {
+                        $hash = md5($filter);
+                        $denseVectorMessage = new DenseVectorQueryMessage();
+                        $denseVectorMessage->setId($hash);
+                        $denseVectorMessage->setQuery($filter);
+                        $this->bus->dispatch($denseVectorMessage);
+                        $ciclo = 0;
+                        while ($ciclo < 100) {
+                            usleep(100000);
+                            $response = $this->redisClient->get($hash);
+                            if ($response) {
+                                $response = json_decode($response, true);
+                                $this->denseVector = $response['vector'];
+                                break;
+                            }
+                            ++$ciclo;
+                        }
+                    }
+                }
+
+                if (str_starts_with($filter, 'eq:')) {
+                    $term = new MatchQuery($this->processaProperty($property), str_replace('eq:', '', $filter));
+                    $boolQuery->add($term, BoolQuery::MUST);
+                }
+
+                if (0 === strpos($filter, 'neq:')) {
+                    $term = new MatchQuery($this->processaProperty($property), str_replace('neq:', '', $filter));
+                    $boolQuery->add($term, BoolQuery::MUST_NOT);
+                }
+
+                if (str_starts_with($filter, 'like:')) {
+                    $mask = '';
+                    if (isset($root['asterisk']) && true === $root['asterisk']) {
+                        $mask = '*';
+                        $filter = preg_replace('/\s+/', '* *', $filter);
+                    }
+                    $queryString = new QueryStringQuery(
+                        $this->processaTermo(str_replace('like:', '', str_replace('%', $mask, $filter))),
+                        ['default_field' => $this->processaProperty($property), 'default_operator' => 'AND']
+                    );
+                    $boolQuery->add($queryString, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'notLike:')) {
+                    $mask = '';
+                    if (isset($root['asterisk']) && true === $root['asterisk']) {
+                        $mask = '*';
+                        $filter = preg_replace('/\s+/', '* *', $filter);
+                    }
+                    $queryString = new QueryStringQuery(
+                        str_replace('like:', '', str_replace('%', $mask, $filter)),
+                        ['default_field' => $this->processaProperty($property), 'default_operator' => 'AND']
+                    );
+                    $boolQuery->add($queryString, BoolQuery::MUST_NOT);
+                }
+
+                if (str_starts_with($filter, 'gt:')) {
+                    $range = new RangeQuery(
+                        $this->processaProperty($property), ['from' => str_replace('gt:', '', $filter)]
+                    );
+                    $boolQuery->add($range, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'gte:')) {
+                    $range = new RangeQuery(
+                        $this->processaProperty($property), ['from' => str_replace('gte:', '', $filter)]
+                    );
+                    $boolQuery->add($range, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'lt:')) {
+                    $range = new RangeQuery(
+                        $this->processaProperty($property),
+                        ['to' => str_replace('lt:', '', $filter)]
+                    );
+                    $boolQuery->add($range, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'lte:')) {
+                    $range = new RangeQuery(
+                        $this->processaProperty($property),
+                        ['to' => str_replace('lte:', '', $filter)]
+                    );
+                    $boolQuery->add($range, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'in:')) {
+                    $boolOrQuery = new BoolQuery();
+                    foreach (explode(',', str_replace('in:', '', $filter)) as $filtroId) {
+                        $term = new MatchQuery($this->processaProperty($property), $filtroId);
+                        $boolOrQuery->add($term, BoolQuery::SHOULD);
+                    }
+                    $boolQuery->add($boolOrQuery, BoolQuery::MUST);
+                }
+
+                if (str_starts_with($filter, 'notIn:')) {
+                    $boolOrQuery = new BoolQuery();
+                    foreach (explode(',', str_replace('in:', '', $filter)) as $filtroId) {
+                        $term = new MatchQuery($this->processaProperty($property), $filtroId);
+                        $boolOrQuery->add($term, BoolQuery::SHOULD);
+                    }
+                    $boolQuery->add($boolOrQuery, BoolQuery::MUST_NOT);
+                }
+
+                if (str_starts_with($filter, 'isNull')) {
+                    $exists = new ExistsQuery($this->processaProperty($property));
+                    $boolQuery->add($exists, BoolQuery::MUST_NOT);
+                }
+
+                if (str_starts_with($filter, 'isNotNull')) {
+                    $exists = new ExistsQuery($this->processaProperty($property));
+                    $boolQuery->add($exists, BoolQuery::MUST);
+                }
+            }
+        }
+
+        return $boolQuery;
+    }
+
+    /**
+     * @param string $input
+     *
+     * @return string
+     */
+    public function processaProperty(string $input): string
+    {
+        if ('id' === $input && 'keyword' === $this->config['indexes'][$this->index]['properties'][$input]['type']) {
+            return '_id';
+        }
+
+        $input = str_replace('.id', '._id', $input);
+
+        if (isset($this->config['indexes'][$this->index]['properties'][$input]['name'])) {
+            return $this->config['indexes'][$this->index]['properties'][$input]['name'];
+        }
+
+        return strtolower(preg_replace('/(?<!^)[A-Z]/', '_$0', $input));
+    }
+
+    /**
+     * @param $termo
+     *
+     * @return string
+     */
+    private function processaTermo($termo): string
+    {
+        $aspas = (substr_count($termo, '"')) % 2;
+        if (0 !== $aspas) {
+            $termo = str_replace('"', ' ', $termo);
+        }
+        $termos = explode(' ', $termo);
+
+        foreach ($termos as $index => $t) {
+            if (false !== mb_strpos($t, '/', 0, 'UTF-8') &&
+                ('"' != mb_substr($t, 0, 1)) &&
+                ('"' != mb_substr($t, -1))
+            ) {
+                $termos[$index] = '"'.$t.'"';
+            }
+        }
+
+        $termo = implode(' ', $termos);
+
+        $termo = str_replace(' E ', ' AND ', $termo);
+        $termo = str_replace(' e ', ' AND ', $termo);
+        $termo = str_replace(' OU ', ' OR ', $termo);
+        $termo = str_replace(' ou ', ' OR ', $termo);
+
+        $chars = ['\\', '+', '-', '&&', '||', '!', '{', '}', '[', ']', ':', '/'];
+
+        foreach ($chars as $char) {
+            $termo = str_replace($char, ' ', $termo);
+        }
+
+        return $termo;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getDenseVector(): mixed
+    {
+        return $this->denseVector;
+    }
+}

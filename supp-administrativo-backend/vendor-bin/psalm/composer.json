@@ -1,0 +1,22 @@
+{
+	"name": "supp-core/psalm",
+	"require": {},
+	"require-dev": {
+		"roave/security-advisories": "dev-latest",
+		"psalm/plugin-phpunit": "0.16.1",
+		"psalm/plugin-symfony": "3.1.5",
+		"vimeo/psalm": "4.23.0"
+	},
+	"config": {
+		"platform": {
+			"php": "8.1.0"
+		},
+		"preferred-install": {
+			"*": "dist"
+		},
+		"sort-packages": true,
+		"allow-plugins": {
+			"composer/package-versions-deprecated": true
+		}
+	}
+}
