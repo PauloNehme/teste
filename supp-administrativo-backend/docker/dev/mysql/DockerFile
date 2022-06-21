@@ -1,4 +1,0 @@
-FROM mysql:8.0.28
-
-WORKDIR /app
-EXPOSE 3306
